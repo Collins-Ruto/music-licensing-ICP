@@ -4,6 +4,7 @@ use candid::{Decode, Encode};
 use ic_stable_structures::memory_manager::{MemoryId, MemoryManager, VirtualMemory};
 use ic_stable_structures::{BoundedStorable, Cell, DefaultMemoryImpl, StableBTreeMap, Storable};
 use std::{borrow::Cow, cell::RefCell};
+use validator::Validate;
 
 // Define type aliases for convenience
 type Memory = VirtualMemory<DefaultMemoryImpl>;
@@ -152,8 +153,9 @@ thread_local! {
 }
 
 // Define structs for payload data (used in update calls)
-#[derive(candid::CandidType, Clone, Serialize, Deserialize)]
+#[derive(candid::CandidType, Clone, Serialize, Deserialize, Validate)]
 struct SongPayload {
+    #[validate(length(min = 2))]
     title: String,
     artist: String,
     owner_id: u64,
@@ -162,8 +164,9 @@ struct SongPayload {
     price: u32,
 }
 
-#[derive(candid::CandidType, Clone, Serialize, Deserialize)]
+#[derive(candid::CandidType, Clone, Serialize, Deserialize, Validate)]
 struct OwnerPayload {
+    #[validate(length(min = 2))]
     name: String,
     email: String,
     auth_key: String,
@@ -177,8 +180,9 @@ struct LicensePayload {
     end_date: String,
 }
 
-#[derive(candid::CandidType, Clone, Serialize, Deserialize)]
+#[derive(candid::CandidType, Clone, Serialize, Deserialize, Validate)]
 struct LicenseePayload {
+    #[validate(length(min = 2))]
     name: String,
     email: String,
 }
@@ -190,16 +194,17 @@ struct ProtectedPayload {
 }
 
 #[derive(candid::CandidType, Clone, Serialize, Deserialize)]
-struct Approvepayload {
+struct ApprovePayload {
     auth_key: String,
     license_id: u64,
     cost: u32,
 }
 
-#[derive(candid::CandidType, Clone, Serialize, Deserialize)]
+#[derive(candid::CandidType, Clone, Serialize, Deserialize, Validate)]
 struct UpdateSongPayload {
     auth_key: String,
     id: u64,
+    #[validate(length(min = 2))]
     title: String,
     artist: String,
     year: u32,
@@ -210,12 +215,15 @@ struct UpdateSongPayload {
 // Define query functions to get all licensable songs
 #[ic_cdk::query]
 fn get_all_songs() -> Result<Vec<Song>, Error> {
+    // Retrieve all songs from the storage
     let songs_vec: Vec<(u64, Song)> = SONG_STORAGE.with(|s| s.borrow().iter().collect());
+    // Extract the songs from the tuple and create a vector
     let songs: Vec<Song> = songs_vec.into_iter().map(|(_, song)| song).collect();
 
+    // Check if any songs are found
     match songs.len() {
         0 => Err(Error::NotFound {
-            msg: format!("no songs licensable could be found"),
+            msg: format!("no licensable songs could be found"),
         }),
         _ => Ok(songs),
     }
@@ -224,6 +232,7 @@ fn get_all_songs() -> Result<Vec<Song>, Error> {
 // Define query functions to get songs by id
 #[ic_cdk::query]
 fn get_song(id: u64) -> Result<Song, Error> {
+    // Try to get the song by id
     match _get_song(&id) {
         Some(song) => Ok(song),
         None => Err(Error::NotFound {
@@ -232,6 +241,7 @@ fn get_song(id: u64) -> Result<Song, Error> {
     }
 }
 
+// Helper function to get a song by id
 fn _get_song(id: &u64) -> Option<Song> {
     SONG_STORAGE.with(|s| s.borrow().get(id))
 }
@@ -239,6 +249,20 @@ fn _get_song(id: &u64) -> Option<Song> {
 // Define update functions to create new songs
 #[ic_cdk::update]
 fn create_song(payload: SongPayload) -> Result<Song, Error> {
+    // Validate Payload
+    let validate_payload = payload.validate();
+    if validate_payload.is_err() {
+        return Err(Error::InvalidPayload {
+            msg: validate_payload.unwrap_err().to_string(),
+        });
+    }
+
+    if _get_owner(&payload.owner_id).is_none() {
+        return Err(Error::NotFound {
+            msg: format!("owner id:{} could not be found, add ownwer first", payload.owner_id.clone()),
+        });
+    }
+
     // Increment the global ID counter to get a new unique ID
     let id = ID_COUNTER
         .with(|counter| {
@@ -247,6 +271,7 @@ fn create_song(payload: SongPayload) -> Result<Song, Error> {
         })
         .expect("Cannot increment Ids");
 
+    // Create a new song based on the provided payload
     let song = Song {
         id,
         title: payload.title.clone(),
@@ -257,6 +282,7 @@ fn create_song(payload: SongPayload) -> Result<Song, Error> {
         price: payload.price,
     };
 
+    // Check if the owner exists
     match _get_owner(&id) {
         Some(_) => {
             return Err(Error::InvalidPayload {
@@ -266,11 +292,13 @@ fn create_song(payload: SongPayload) -> Result<Song, Error> {
         None => (),
     }
 
+    // Add the new song to the owner's list of songs
     match add_song_to_owner(song.owner_id, song.id) {
         Ok(_) => (),
         Err(e) => return Err(e),
     }
 
+    // Store the new song in the SONG_STORAGE
     match SONG_STORAGE.with(|s| s.borrow_mut().insert(id, song.clone())) {
         None => Ok(song),
         Some(_) => Err(Error::InvalidPayload {
@@ -282,6 +310,7 @@ fn create_song(payload: SongPayload) -> Result<Song, Error> {
 // Define query functions to get owners by id
 #[ic_cdk::query]
 fn get_song_owner(id: u64) -> Result<ReturnOwner, Error> {
+    // Retrieve the song by id
     let song = match _get_song(&id) {
         Some(song) => song,
         None => {
@@ -291,6 +320,7 @@ fn get_song_owner(id: u64) -> Result<ReturnOwner, Error> {
         }
     };
 
+    // Retrieve the owner of the song
     match _get_owner(&song.owner_id) {
         Some(owner) => Ok(ReturnOwner {
             id: owner.id,
@@ -303,8 +333,47 @@ fn get_song_owner(id: u64) -> Result<ReturnOwner, Error> {
     }
 }
 
+// Define query functions to search songs by title
+#[ic_cdk::query]
+fn search_song_title_genre_year(title: String) -> Result<Vec<Song>, Error> {
+    let query_title = title.to_lowercase();
+    // Retrieve all songs from the storage
+    let songs_vec: Vec<(u64, Song)> = SONG_STORAGE.with(|s| s.borrow().iter().collect());
+    // Extract the songs from the tuple and create a vector
+    let songs: Vec<Song> = songs_vec.into_iter().map(|(_, song)| song).collect();
+    let mut matching_songs: Vec<Song> = Vec::new();
+
+    // Filter songs for the specified title
+    for song in songs {
+        if song.title.to_lowercase().contains(&query_title)
+            || song.year.to_string().to_lowercase().contains(&query_title)
+            || song.genre.to_lowercase().contains(&query_title)
+        {
+            matching_songs.push(song);
+        }
+    }
+
+    // Handle cases where no songs are found or return the result
+    match matching_songs.len() {
+        0 => Err(Error::NotFound {
+            msg: format!("no songs could be found with title:{}", title),
+        }),
+        _ => Ok(matching_songs),
+    }
+}
+
+// Define update functions to update an existing song
 #[ic_cdk::update]
 fn update_song(payload: UpdateSongPayload) -> Result<Song, Error> {
+    // Validate Payload
+    let validate_payload = payload.validate();
+    if validate_payload.is_err() {
+        return Err(Error::InvalidPayload {
+            msg: validate_payload.unwrap_err().to_string(),
+        });
+    }
+
+    // Retrieve the existing song based on the payload
     let song = match _get_song(&payload.id) {
         Some(song) => song,
         None => {
@@ -314,6 +383,7 @@ fn update_song(payload: UpdateSongPayload) -> Result<Song, Error> {
         }
     };
 
+    // Retrieve the owner of the song
     let owner = match _get_owner(&song.owner_id) {
         Some(owner) => owner,
         None => {
@@ -323,8 +393,9 @@ fn update_song(payload: UpdateSongPayload) -> Result<Song, Error> {
         }
     };
 
+    // Check if the provided auth_key matches the owner's auth_key
     if owner.auth_key != payload.auth_key {
-        return Err(Error::InvalidPayload {
+        return Err(Error::Unauthorized {
             msg: format!(
                 "auth key:{} is invalid, only song owner can update",
                 payload.auth_key
@@ -332,6 +403,7 @@ fn update_song(payload: UpdateSongPayload) -> Result<Song, Error> {
         });
     }
 
+    // Create a new song with updated information
     let mut new_song = song.clone();
     new_song.title = payload.title.clone();
     new_song.artist = payload.artist;
@@ -339,6 +411,7 @@ fn update_song(payload: UpdateSongPayload) -> Result<Song, Error> {
     new_song.genre = payload.genre;
     new_song.price = payload.price;
 
+    // Store the updated song
     match SONG_STORAGE.with(|s| s.borrow_mut().insert(payload.id, new_song.clone())) {
         Some(_) => Ok(new_song),
         None => Err(Error::InvalidPayload {
@@ -350,8 +423,10 @@ fn update_song(payload: UpdateSongPayload) -> Result<Song, Error> {
     }
 }
 
+// Define update functions to delete an existing song
 #[ic_cdk::update]
 fn delete_song(auth_key: String, id: u64) -> Result<Song, Error> {
+    // Retrieve the existing song based on the id
     let song = match _get_song(&id) {
         Some(song) => song,
         None => {
@@ -361,6 +436,7 @@ fn delete_song(auth_key: String, id: u64) -> Result<Song, Error> {
         }
     };
 
+    // Retrieve the owner of the song
     let owner = match _get_owner(&song.owner_id) {
         Some(owner) => owner,
         None => {
@@ -370,6 +446,7 @@ fn delete_song(auth_key: String, id: u64) -> Result<Song, Error> {
         }
     };
 
+    // Check if the provided auth_key matches the owner's auth_key
     if owner.auth_key != auth_key {
         return Err(Error::InvalidPayload {
             msg: format!(
@@ -379,16 +456,19 @@ fn delete_song(auth_key: String, id: u64) -> Result<Song, Error> {
         });
     }
 
+    // Remove the song from owner's list
     match remove_song_from_owner(id) {
         Ok(_) => (),
         Err(e) => return Err(e),
     }
 
+    // Remove the song from licensee's list
     match remove_song_from_licensee(id) {
         Ok(_) => (),
         Err(e) => return Err(e),
     }
 
+    // Remove the song from the SONG_STORAGE
     match SONG_STORAGE.with(|s| s.borrow_mut().remove(&id)) {
         Some(song) => Ok(song),
         None => Err(Error::InvalidPayload {
@@ -397,11 +477,14 @@ fn delete_song(auth_key: String, id: u64) -> Result<Song, Error> {
     }
 }
 
+// Helper function to get an owner by id
 fn _get_owner(id: &u64) -> Option<Owner> {
     OWNER_STORAGE.with(|s| s.borrow().get(id))
 }
 
+// Helper function to add a song to an owner's list
 fn add_song_to_owner(owner_id: u64, song_id: u64) -> Result<(), Error> {
+    // Retrieve the owner
     let mut owner = match _get_owner(&owner_id) {
         Some(owner) => owner,
         None => {
@@ -411,8 +494,10 @@ fn add_song_to_owner(owner_id: u64, song_id: u64) -> Result<(), Error> {
         }
     };
 
+    // Add the song id to the owner's list of song ids
     owner.song_ids.push(song_id);
 
+    // Store the updated owner
     match OWNER_STORAGE.with(|s| s.borrow_mut().insert(owner_id, owner.clone())) {
         Some(_) => Ok(()),
         None => Err(Error::InvalidPayload {
@@ -424,8 +509,17 @@ fn add_song_to_owner(owner_id: u64, song_id: u64) -> Result<(), Error> {
     }
 }
 
+// Define update function to create a new owner
 #[ic_cdk::update]
 fn create_owner(payload: OwnerPayload) -> Result<Owner, Error> {
+    // Validate Payload
+    let validate_payload = payload.validate();
+    if validate_payload.is_err() {
+        return Err(Error::InvalidPayload {
+            msg: validate_payload.unwrap_err().to_string(),
+        });
+    }
+
     // Increment the global ID counter to get a new unique ID
     let id = ID_COUNTER
         .with(|counter| {
@@ -434,6 +528,7 @@ fn create_owner(payload: OwnerPayload) -> Result<Owner, Error> {
         })
         .expect("Cannot increment Ids");
 
+    // Create a new owner instance
     let owner = Owner {
         id,
         name: payload.name.clone(),
@@ -443,6 +538,7 @@ fn create_owner(payload: OwnerPayload) -> Result<Owner, Error> {
         license_ids: Vec::new(),
     };
 
+    // Insert the owner into the storage and handle potential errors
     match OWNER_STORAGE.with(|s| s.borrow_mut().insert(id, owner.clone())) {
         None => Ok(owner),
         Some(_) => Err(Error::InvalidPayload {
@@ -451,6 +547,7 @@ fn create_owner(payload: OwnerPayload) -> Result<Owner, Error> {
     }
 }
 
+// Define query function to get a license by ID
 #[ic_cdk::query]
 fn get_license(id: u64) -> Result<License, Error> {
     match _get_license(&id) {
@@ -461,8 +558,10 @@ fn get_license(id: u64) -> Result<License, Error> {
     }
 }
 
+// Define query function to get license requests for a specific owner
 #[ic_cdk::query]
 fn get_owner_license_requests(id: u64) -> Result<Vec<License>, Error> {
+    // Retrieve all licenses from storage
     let licenses_vec: Vec<(u64, License)> = LICENSE_STORAGE.with(|s| s.borrow().iter().collect());
     let licenses: Vec<License> = licenses_vec
         .into_iter()
@@ -470,12 +569,14 @@ fn get_owner_license_requests(id: u64) -> Result<Vec<License>, Error> {
         .collect();
     let mut owner_licenses: Vec<License> = Vec::new();
 
+    // Filter licenses for the specified owner ID
     for license in licenses {
         if license.owner_id == id {
             owner_licenses.push(license);
         }
     }
 
+    // Handle cases where no licenses are found or return the result
     match owner_licenses.len() {
         0 => Err(Error::NotFound {
             msg: format!("no licenses could be found for owner id:{}", id),
@@ -484,8 +585,10 @@ fn get_owner_license_requests(id: u64) -> Result<Vec<License>, Error> {
     }
 }
 
+// Define query function to get licenses for a specific licensee
 #[ic_cdk::query]
 fn get_licensee_licenses(id: u64) -> Result<Vec<License>, Error> {
+    // Retrieve all licenses from storage
     let licenses_vec: Vec<(u64, License)> = LICENSE_STORAGE.with(|s| s.borrow().iter().collect());
     let licenses: Vec<License> = licenses_vec
         .into_iter()
@@ -493,12 +596,14 @@ fn get_licensee_licenses(id: u64) -> Result<Vec<License>, Error> {
         .collect();
     let mut licensee_licenses: Vec<License> = Vec::new();
 
+    // Filter licenses for the specified licensee ID
     for license in licenses {
         if license.licensee_id == id {
             licensee_licenses.push(license);
         }
     }
 
+    // Handle cases where no licenses are found or return the result
     match licensee_licenses.len() {
         0 => Err(Error::NotFound {
             msg: format!("no licenses could be found for licensee id:{}", id),
@@ -507,6 +612,7 @@ fn get_licensee_licenses(id: u64) -> Result<Vec<License>, Error> {
     }
 }
 
+// Define update function to create a new license request
 #[ic_cdk::update]
 fn create_license_request(payload: LicensePayload) -> Result<License, Error> {
     // Increment the global ID counter to get a new unique ID
@@ -517,6 +623,17 @@ fn create_license_request(payload: LicensePayload) -> Result<License, Error> {
         })
         .expect("Cannot increment Ids");
 
+    // validate licensee
+    match _get_licensee(&payload.licensee_id) {
+        Some(_) => (),
+        None => {
+            return Err(Error::NotFound {
+                msg: format!("licensee id:{} could not be found, add them first", payload.licensee_id),
+            })
+        }
+    }
+
+    // Retrieve the corresponding song for the license request
     let song = match _get_song(&payload.song_id) {
         Some(song) => song,
         None => {
@@ -526,6 +643,7 @@ fn create_license_request(payload: LicensePayload) -> Result<License, Error> {
         }
     };
 
+    // Create a new license instance
     let license = License {
         id,
         song_id: payload.song_id,
@@ -537,6 +655,7 @@ fn create_license_request(payload: LicensePayload) -> Result<License, Error> {
         end_date: payload.end_date,
     };
 
+    // Insert the license request into storage and handle potential errors
     match LICENSE_STORAGE.with(|s| s.borrow_mut().insert(id, license.clone())) {
         None => Ok(license),
         Some(_) => Err(Error::InvalidPayload {
@@ -545,8 +664,10 @@ fn create_license_request(payload: LicensePayload) -> Result<License, Error> {
     }
 }
 
+// Define update function to approve a license
 #[ic_cdk::update]
-fn approve_license(payload: Approvepayload) -> Result<License, Error> {
+fn approve_license(payload: ApprovePayload) -> Result<License, Error> {
+    // Retrieve the license to be approved
     let license = match _get_license(&payload.license_id) {
         Some(license) => license,
         None => {
@@ -556,6 +677,7 @@ fn approve_license(payload: Approvepayload) -> Result<License, Error> {
         }
     };
 
+    // Retrieve the owner of the license
     let owner = match _get_owner(&license.owner_id) {
         Some(owner) => owner,
         None => {
@@ -565,8 +687,9 @@ fn approve_license(payload: Approvepayload) -> Result<License, Error> {
         }
     };
 
+    // Validate the authenticity of the approval request
     if owner.auth_key != payload.auth_key {
-        return Err(Error::InvalidPayload {
+        return Err(Error::Unauthorized {
             msg: format!(
                 "auth key:{} is invalid, only song owner can approve",
                 payload.auth_key
@@ -574,6 +697,7 @@ fn approve_license(payload: Approvepayload) -> Result<License, Error> {
         });
     }
 
+    // Check if the license has already been approved
     if license.approved {
         return Err(Error::AlreadyApproved {
             msg: format!(
@@ -583,10 +707,12 @@ fn approve_license(payload: Approvepayload) -> Result<License, Error> {
         });
     }
 
+    // Create a new license with the approval and cost information
     let mut new_license = license.clone();
     new_license.approved = true;
     new_license.price = payload.cost;
 
+    // Update the owner and licensee with the approved license
     match add_license_to_owner(license.owner_id, license.id) {
         Ok(_) => (),
         Err(e) => return Err(e),
@@ -597,6 +723,7 @@ fn approve_license(payload: Approvepayload) -> Result<License, Error> {
         Err(e) => return Err(e),
     }
 
+    // Update the license in storage and handle potential errors
     match LICENSE_STORAGE.with(|s| {
         s.borrow_mut()
             .insert(payload.license_id, new_license.clone())
@@ -608,8 +735,10 @@ fn approve_license(payload: Approvepayload) -> Result<License, Error> {
     }
 }
 
+// Define update function to revoke a license
 #[ic_cdk::update]
 fn revoke_license(payload: ProtectedPayload) -> Result<License, Error> {
+    // Retrieve the license to be revoked
     let license = match _get_license(&payload.license_id) {
         Some(license) => license,
         None => {
@@ -619,6 +748,7 @@ fn revoke_license(payload: ProtectedPayload) -> Result<License, Error> {
         }
     };
 
+    // Retrieve the owner of the license
     let owner = match _get_owner(&license.owner_id) {
         Some(owner) => owner,
         None => {
@@ -628,8 +758,9 @@ fn revoke_license(payload: ProtectedPayload) -> Result<License, Error> {
         }
     };
 
+    // Validate the authenticity of the revocation request
     if owner.auth_key != payload.auth_key {
-        return Err(Error::InvalidPayload {
+        return Err(Error::Unauthorized {
             msg: format!(
                 "auth key:{} is invalid, only song owner can revoke",
                 payload.auth_key
@@ -637,9 +768,11 @@ fn revoke_license(payload: ProtectedPayload) -> Result<License, Error> {
         });
     }
 
+    // Create a new license with the approval set to false
     let mut new_license = license.clone();
     new_license.approved = false;
 
+    // Remove the license from owner and licensee
     match remove_license_from_owner(license.owner_id, license.id) {
         Ok(_) => (),
         Err(e) => return Err(e),
@@ -650,6 +783,7 @@ fn revoke_license(payload: ProtectedPayload) -> Result<License, Error> {
         Err(e) => return Err(e),
     }
 
+    // Update the license in storage and handle potential errors
     match LICENSE_STORAGE.with(|s| {
         s.borrow_mut()
             .insert(payload.license_id, new_license.clone())
@@ -661,10 +795,12 @@ fn revoke_license(payload: ProtectedPayload) -> Result<License, Error> {
     }
 }
 
+// Helper function to retrieve a license by ID
 fn _get_license(id: &u64) -> Option<License> {
     LICENSE_STORAGE.with(|s| s.borrow().get(id))
 }
 
+// Define query function to get a licensee by ID
 #[ic_cdk::query]
 fn get_licensee(id: u64) -> Result<Licensee, Error> {
     match _get_licensee(&id) {
@@ -675,12 +811,22 @@ fn get_licensee(id: u64) -> Result<Licensee, Error> {
     }
 }
 
+// Helper function to retrieve a licensee by ID
 fn _get_licensee(id: &u64) -> Option<Licensee> {
     LICENSEE_STORAGE.with(|s| s.borrow().get(id))
 }
 
+// Define update function to create a new licensee
 #[ic_cdk::update]
 fn create_licensee(payload: LicenseePayload) -> Result<Licensee, Error> {
+    // Validate Payload
+    let validate_payload = payload.validate();
+    if validate_payload.is_err() {
+        return Err(Error::InvalidPayload {
+            msg: validate_payload.unwrap_err().to_string(),
+        });
+    }
+
     // Increment the global ID counter to get a new unique ID
     let id = ID_COUNTER
         .with(|counter| {
@@ -689,6 +835,7 @@ fn create_licensee(payload: LicenseePayload) -> Result<Licensee, Error> {
         })
         .expect("Cannot increment Ids");
 
+    // Create a new licensee instance
     let licensee = Licensee {
         id,
         name: payload.name.clone(),
@@ -696,6 +843,7 @@ fn create_licensee(payload: LicenseePayload) -> Result<Licensee, Error> {
         licenses: Vec::new(),
     };
 
+    // Insert the licensee into storage and handle potential errors
     match LICENSEE_STORAGE.with(|s| s.borrow_mut().insert(id, licensee.clone())) {
         None => Ok(licensee),
         Some(_) => Err(Error::InvalidPayload {
@@ -704,6 +852,7 @@ fn create_licensee(payload: LicenseePayload) -> Result<Licensee, Error> {
     }
 }
 
+// Helper function to add a license to an owner
 fn add_license_to_owner(owner_id: u64, license_id: u64) -> Result<(), Error> {
     let mut owner = match _get_owner(&owner_id) {
         Some(owner) => owner,
@@ -716,6 +865,7 @@ fn add_license_to_owner(owner_id: u64, license_id: u64) -> Result<(), Error> {
 
     owner.license_ids.push(license_id);
 
+    // Insert the updated owner into storage and handle potential errors
     match OWNER_STORAGE.with(|s| s.borrow_mut().insert(owner_id, owner.clone())) {
         Some(_) => Ok(()),
         None => Err(Error::InvalidPayload {
@@ -727,6 +877,7 @@ fn add_license_to_owner(owner_id: u64, license_id: u64) -> Result<(), Error> {
     }
 }
 
+// Helper function to add a license to a licensee
 fn add_license_to_licensee(licensee_id: u64, license_id: u64) -> Result<(), Error> {
     let mut licensee = match _get_licensee(&licensee_id) {
         Some(licensee) => licensee,
@@ -739,6 +890,7 @@ fn add_license_to_licensee(licensee_id: u64, license_id: u64) -> Result<(), Erro
 
     licensee.licenses.push(license_id);
 
+    // Insert the updated licensee into storage and handle potential errors
     match LICENSEE_STORAGE.with(|s| s.borrow_mut().insert(licensee_id, licensee.clone())) {
         Some(_) => Ok(()),
         None => Err(Error::InvalidPayload {
@@ -750,6 +902,7 @@ fn add_license_to_licensee(licensee_id: u64, license_id: u64) -> Result<(), Erro
     }
 }
 
+// Helper function to remove a license from an owner
 fn remove_license_from_owner(owner_id: u64, license_id: u64) -> Result<(), Error> {
     let mut owner = match _get_owner(&owner_id) {
         Some(owner) => owner,
@@ -760,6 +913,7 @@ fn remove_license_from_owner(owner_id: u64, license_id: u64) -> Result<(), Error
         }
     };
 
+    // Find the index of the license ID in the owner's list
     let mut index = 0;
     let mut found = false;
     for (i, id) in owner.license_ids.iter().enumerate() {
@@ -770,6 +924,7 @@ fn remove_license_from_owner(owner_id: u64, license_id: u64) -> Result<(), Error
         }
     }
 
+    // Handle the case where the license ID is not found in the owner's list
     if !found {
         return Err(Error::NotFound {
             msg: format!(
@@ -779,8 +934,10 @@ fn remove_license_from_owner(owner_id: u64, license_id: u64) -> Result<(), Error
         });
     }
 
+    // Remove the license ID from the owner's list
     owner.license_ids.remove(index);
 
+    // Insert the updated owner into storage and handle potential errors
     match OWNER_STORAGE.with(|s| s.borrow_mut().insert(owner_id, owner.clone())) {
         Some(_) => Ok(()),
         None => Err(Error::InvalidPayload {
@@ -792,7 +949,9 @@ fn remove_license_from_owner(owner_id: u64, license_id: u64) -> Result<(), Error
     }
 }
 
+// Helper function to remove a license from a licensee
 fn remove_license_from_licensee(licensee_id: u64, license_id: u64) -> Result<(), Error> {
+    // Retrieve the licensee to update
     let mut licensee = match _get_licensee(&licensee_id) {
         Some(licensee) => licensee,
         None => {
@@ -802,6 +961,7 @@ fn remove_license_from_licensee(licensee_id: u64, license_id: u64) -> Result<(),
         }
     };
 
+    // Find the index of the license ID in the licensee's list
     let mut index = 0;
     let mut found = false;
     for (i, id) in licensee.licenses.iter().enumerate() {
@@ -812,6 +972,7 @@ fn remove_license_from_licensee(licensee_id: u64, license_id: u64) -> Result<(),
         }
     }
 
+    // Handle the case where the license ID is not found in the licensee's list
     if !found {
         return Err(Error::NotFound {
             msg: format!(
@@ -821,8 +982,10 @@ fn remove_license_from_licensee(licensee_id: u64, license_id: u64) -> Result<(),
         });
     }
 
+    // Remove the license ID from the licensee's list
     licensee.licenses.remove(index);
 
+    // Update the licensee in storage and handle potential errors
     match LICENSEE_STORAGE.with(|s| s.borrow_mut().insert(licensee_id, licensee.clone())) {
         Some(_) => Ok(()),
         None => Err(Error::InvalidPayload {
@@ -834,15 +997,19 @@ fn remove_license_from_licensee(licensee_id: u64, license_id: u64) -> Result<(),
     }
 }
 
+// Helper function to remove a song from an owner
 fn remove_song_from_owner(id: u64) -> Result<(), Error> {
+    // Retrieve the song to be removed
     let song = _get_song(&id).ok_or(Error::NotFound {
         msg: format!("song id:{} could not be found", id),
     })?;
 
+    // Retrieve the owner of the song
     let mut owner = _get_owner(&song.owner_id).ok_or(Error::NotFound {
         msg: format!("owner id:{} could not be found", song.owner_id),
     })?;
 
+    // Find the index of the song ID in the owner's list
     let index = owner
         .song_ids
         .iter()
@@ -854,8 +1021,10 @@ fn remove_song_from_owner(id: u64) -> Result<(), Error> {
             ),
         })?;
 
+    // Remove the song ID from the owner's list
     owner.song_ids.remove(index);
 
+    // Update the owner in storage and handle potential errors
     match OWNER_STORAGE.with(|s| s.borrow_mut().insert(owner.id, owner.clone())) {
         Some(_) => Ok(()),
         None => Err(Error::InvalidPayload {
@@ -867,29 +1036,36 @@ fn remove_song_from_owner(id: u64) -> Result<(), Error> {
     }
 }
 
+// Helper function to remove a song from all associated licensees
 fn remove_song_from_licensee(id: u64) -> Result<(), Error> {
+    // Retrieve the song to be removed
     let song = _get_song(&id).ok_or(Error::NotFound {
         msg: format!("song id:{} could not be found", id),
     })?;
 
+    // Retrieve all licenses from storage
     let licenses_vec: Vec<(u64, License)> = LICENSE_STORAGE.with(|s| s.borrow().iter().collect());
     let licenses: Vec<License> = licenses_vec
         .into_iter()
         .map(|(_, license)| license)
         .collect();
-    let mut licenses_to_remove: Vec<License> = Vec::new();
 
+    // Identify licenses associated with the song
+    let mut licenses_to_remove: Vec<License> = Vec::new();
     for license in licenses {
         if license.song_id == song.id {
             licenses_to_remove.push(license);
         }
     }
 
+    // Iterate over associated licenses and remove the song ID from each licensee's list
     for license in licenses_to_remove {
+        // Retrieve the licensee to update
         let mut licensee = _get_licensee(&license.licensee_id).ok_or(Error::NotFound {
             msg: format!("licensee id:{} could not be found", license.licensee_id),
         })?;
 
+        // Find the index of the license ID in the licensee's list
         let index = licensee
             .licenses
             .iter()
@@ -901,8 +1077,10 @@ fn remove_song_from_licensee(id: u64) -> Result<(), Error> {
                 ),
             })?;
 
+        // Remove the license ID from the licensee's list
         licensee.licenses.remove(index);
 
+        // Update the licensee in storage and handle potential errors
         match LICENSEE_STORAGE.with(|s| s.borrow_mut().insert(licensee.id, licensee.clone())) {
             Some(_) => (),
             None => {
@@ -923,8 +1101,9 @@ fn remove_song_from_licensee(id: u64) -> Result<(), Error> {
 #[derive(candid::CandidType, Deserialize, Serialize)]
 enum Error {
     NotFound { msg: String },
-    InvalidPayload { msg: String },
     AlreadyApproved { msg: String },
+    InvalidPayload { msg: String },
+    Unauthorized { msg: String },
 }
 
 // Candid generator for Candid interface
